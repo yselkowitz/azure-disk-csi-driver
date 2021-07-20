@@ -19,7 +19,9 @@ package e2e
 import (
 	"context"
 	"fmt"
+	"os"
 
+	"sigs.k8s.io/azuredisk-csi-driver/pkg/azuredisk"
 	"sigs.k8s.io/azuredisk-csi-driver/test/e2e/driver"
 	"sigs.k8s.io/azuredisk-csi-driver/test/e2e/testsuites"
 
@@ -121,9 +123,11 @@ func (t *dynamicProvisioningTestSuite) defineTests(isMultiZone bool) {
 			},
 		}
 		test := testsuites.DynamicallyProvisionedCmdVolumeTest{
-			CSIDriver:              testDriver,
-			Pods:                   pods,
-			StorageClassParameters: map[string]string{"skuName": "Standard_LRS"},
+			CSIDriver: testDriver,
+			Pods:      pods,
+			StorageClassParameters: map[string]string{
+				"skuName": "Standard_LRS",
+			},
 		}
 
 		if isMultiZone && !isUsingInTreeVolumePlugin {
@@ -134,6 +138,79 @@ func (t *dynamicProvisioningTestSuite) defineTests(isMultiZone bool) {
 				"diskMbpsReadWrite": "320",
 				"logicalSectorSize": "512",
 			}
+		}
+		if !isUsingInTreeVolumePlugin && supportsZRS {
+			test.StorageClassParameters = map[string]string{
+				"skuName":             "StandardSSD_ZRS",
+				"networkAccessPolicy": "AllowAll",
+			}
+		}
+		if isUsingInTreeVolumePlugin {
+			// cover case: https://github.com/kubernetes/kubernetes/issues/103433
+			test.StorageClassParameters["Kind"] = "managed"
+		}
+		test.Run(cs, ns)
+	})
+
+	ginkgo.It("should create a pod with volume mount subpath [disk.csi.azure.com] [Windows]", func() {
+		skipIfUsingInTreeVolumePlugin()
+
+		pods := []testsuites.PodDetails{
+			{
+				Cmd: convertToPowershellorCmdCommandIfNecessary("echo 'hello world' > /mnt/test-1/data && grep 'hello world' /mnt/test-1/data"),
+				Volumes: []testsuites.VolumeDetails{
+					{
+						ClaimSize: "10Gi",
+						VolumeMount: testsuites.VolumeMountDetails{
+							NameGenerate:      "test-volume-",
+							MountPathGenerate: "/mnt/test-",
+						},
+					},
+				},
+				IsWindows: isWindowsCluster,
+			},
+		}
+
+		scParameters := map[string]string{
+			"skuName":             "Standard_LRS",
+			"networkAccessPolicy": "DenyAll",
+		}
+		test := testsuites.DynamicallyProvisionedVolumeSubpathTester{
+			CSIDriver:              testDriver,
+			Pods:                   pods,
+			StorageClassParameters: scParameters,
+		}
+		test.Run(cs, ns)
+	})
+
+	ginkgo.It("Should create and attach a volume with basic perfProfile [enableBursting][disk.csi.azure.com] [Windows]", func() {
+		skipIfOnAzureStackCloud()
+		skipIfUsingInTreeVolumePlugin()
+		pods := []testsuites.PodDetails{
+			{
+				Cmd: convertToPowershellorCmdCommandIfNecessary("echo 'hello world' > /mnt/test-1/data && grep 'hello world' /mnt/test-1/data"),
+				Volumes: t.normalizeVolumes([]testsuites.VolumeDetails{
+					{
+						FSType:    "ext4",
+						ClaimSize: "1Ti",
+						VolumeMount: testsuites.VolumeMountDetails{
+							NameGenerate:      "test-volume-",
+							MountPathGenerate: "/mnt/test-",
+						},
+					},
+				}, isMultiZone),
+				IsWindows: isWindowsCluster,
+			},
+		}
+		test := testsuites.DynamicallyProvisionedCmdVolumeTest{
+			CSIDriver: testDriver,
+			Pods:      pods,
+			StorageClassParameters: map[string]string{
+				"skuName":     "Premium_LRS",
+				"perfProfile": "Basic",
+				// enableBursting can only be applied to Premium disk, disk size > 512GB, Ultra & shared disk is not supported.
+				"enableBursting": "true",
+			},
 		}
 		test.Run(cs, ns)
 	})
@@ -165,6 +242,9 @@ func (t *dynamicProvisioningTestSuite) defineTests(isMultiZone bool) {
 			Pods:                   pods,
 			StorageClassParameters: map[string]string{"skuName": "StandardSSD_LRS"},
 		}
+		if !isUsingInTreeVolumePlugin && (location == "westus2" || location == "westeurope") {
+			test.StorageClassParameters = map[string]string{"skuName": "StandardSSD_ZRS"}
+		}
 		if isAzureStackCloud {
 			test.StorageClassParameters = map[string]string{"skuName": "Standard_LRS"}
 		}
@@ -194,6 +274,10 @@ func (t *dynamicProvisioningTestSuite) defineTests(isMultiZone bool) {
 			Pods:                   pods,
 			StorageClassParameters: map[string]string{"skuName": "Premium_LRS"},
 		}
+		if !isUsingInTreeVolumePlugin && supportsZRS {
+			test.StorageClassParameters = map[string]string{"skuName": "StandardSSD_ZRS"}
+		}
+
 		test.Run(cs, ns)
 	})
 
@@ -220,6 +304,9 @@ func (t *dynamicProvisioningTestSuite) defineTests(isMultiZone bool) {
 			CSIDriver:              testDriver,
 			Pods:                   pods,
 			StorageClassParameters: map[string]string{"skuName": "StandardSSD_LRS"},
+		}
+		if !isUsingInTreeVolumePlugin && (location == "westus2" || location == "westeurope") {
+			test.StorageClassParameters = map[string]string{"skuName": "Premium_ZRS"}
 		}
 		if isAzureStackCloud {
 			test.StorageClassParameters = map[string]string{"skuName": "Standard_LRS"}
@@ -278,6 +365,10 @@ func (t *dynamicProvisioningTestSuite) defineTests(isMultiZone bool) {
 			ColocatePods:           true,
 			StorageClassParameters: map[string]string{"skuName": "Premium_LRS"},
 		}
+		if !isUsingInTreeVolumePlugin && supportsZRS {
+			test.StorageClassParameters = map[string]string{"skuName": "StandardSSD_ZRS"}
+		}
+
 		test.Run(cs, ns)
 	})
 
@@ -356,9 +447,6 @@ func (t *dynamicProvisioningTestSuite) defineTests(isMultiZone bool) {
 	ginkgo.It("should clone a volume from an existing volume and read from it [disk.csi.azure.com]", func() {
 		skipIfTestingInWindowsCluster()
 		skipIfUsingInTreeVolumePlugin()
-		if isMultiZone {
-			ginkgo.Skip("test case not supported running in multi zone cluster")
-		}
 
 		pod := testsuites.PodDetails{
 			Cmd: "echo 'hello world' > /mnt/test-1/data",
@@ -385,15 +473,18 @@ func (t *dynamicProvisioningTestSuite) defineTests(isMultiZone bool) {
 				"fsType":  "xfs",
 			},
 		}
+		if !isUsingInTreeVolumePlugin && supportsZRS {
+			test.StorageClassParameters = map[string]string{
+				"skuName":             "StandardSSD_ZRS",
+				"networkAccessPolicy": "DenyAll",
+			}
+		}
 		test.Run(cs, ns)
 	})
 
 	ginkgo.It("should clone a volume of larger size than the source volume and make sure the filesystem is appropriately adjusted [disk.csi.azure.com]", func() {
 		skipIfTestingInWindowsCluster()
 		skipIfUsingInTreeVolumePlugin()
-		if isMultiZone {
-			ginkgo.Skip("test case not supported running in multi zone cluster")
-		}
 
 		pod := testsuites.PodDetails{
 			Volumes: t.normalizeVolumes([]testsuites.VolumeDetails{
@@ -422,6 +513,13 @@ func (t *dynamicProvisioningTestSuite) defineTests(isMultiZone bool) {
 				"skuName": "Standard_LRS",
 				"fsType":  "xfs",
 			},
+		}
+		if !isUsingInTreeVolumePlugin && supportsZRS {
+			test.StorageClassParameters = map[string]string{
+				"skuName":             "StandardSSD_ZRS",
+				"fsType":              "xfs",
+				"networkAccessPolicy": "DenyAll",
+			}
 		}
 		test.Run(cs, ns)
 	})
@@ -467,6 +565,9 @@ func (t *dynamicProvisioningTestSuite) defineTests(isMultiZone bool) {
 		if isAzureStackCloud {
 			test.StorageClassParameters = map[string]string{"skuName": "Standard_LRS"}
 		}
+		if !isUsingInTreeVolumePlugin && supportsZRS {
+			test.StorageClassParameters = map[string]string{"skuName": "StandardSSD_ZRS"}
+		}
 		test.Run(cs, ns)
 	})
 
@@ -503,6 +604,9 @@ func (t *dynamicProvisioningTestSuite) defineTests(isMultiZone bool) {
 			Pods:                   pods,
 			StorageClassParameters: map[string]string{"skuName": "Premium_LRS"},
 		}
+		if !isUsingInTreeVolumePlugin && supportsZRS {
+			test.StorageClassParameters = map[string]string{"skuName": "StandardSSD_ZRS"}
+		}
 		test.Run(cs, ns)
 	})
 
@@ -535,6 +639,9 @@ func (t *dynamicProvisioningTestSuite) defineTests(isMultiZone bool) {
 		}
 		if isAzureStackCloud {
 			test.StorageClassParameters = map[string]string{"skuName": "Standard_LRS"}
+		}
+		if !isUsingInTreeVolumePlugin && supportsZRS {
+			test.StorageClassParameters = map[string]string{"skuName": "StandardSSD_ZRS"}
 		}
 		test.Run(cs, snapshotrcs, ns)
 	})
@@ -575,6 +682,9 @@ func (t *dynamicProvisioningTestSuite) defineTests(isMultiZone bool) {
 		}
 		if isAzureStackCloud {
 			test.StorageClassParameters = map[string]string{"skuName": "Standard_LRS"}
+		}
+		if !isUsingInTreeVolumePlugin && supportsZRS {
+			test.StorageClassParameters = map[string]string{"skuName": "StandardSSD_ZRS"}
 		}
 		test.Run(cs, snapshotrcs, ns)
 	})
@@ -637,10 +747,13 @@ func (t *dynamicProvisioningTestSuite) defineTests(isMultiZone bool) {
 			Pod:                    pod,
 			StorageClassParameters: map[string]string{"skuName": "Standard_LRS"},
 		}
+		if !isUsingInTreeVolumePlugin && supportsZRS {
+			test.StorageClassParameters = map[string]string{"skuName": "StandardSSD_ZRS"}
+		}
 		test.Run(cs, ns)
 	})
 
-	ginkgo.It("should create a volume azuredisk with tag  [disk.csi.azure.com] [Windows]", func() {
+	ginkgo.It("should create a volume azuredisk with tag [disk.csi.azure.com] [Windows]", func() {
 		skipIfUsingInTreeVolumePlugin()
 		pods := []testsuites.PodDetails{
 			{
@@ -667,6 +780,9 @@ func (t *dynamicProvisioningTestSuite) defineTests(isMultiZone bool) {
 			Pods:                   pods,
 			StorageClassParameters: map[string]string{"skuName": "Standard_LRS", "tags": tags},
 			Tags:                   tags,
+		}
+		if !isUsingInTreeVolumePlugin && supportsZRS {
+			test.StorageClassParameters = map[string]string{"skuName": "StandardSSD_ZRS", "tags": tags}
 		}
 		test.Run(cs, ns)
 	})
@@ -695,6 +811,9 @@ func (t *dynamicProvisioningTestSuite) defineTests(isMultiZone bool) {
 			CSIDriver:              testDriver,
 			Pods:                   pods,
 			StorageClassParameters: map[string]string{"skuName": "Standard_LRS"},
+		}
+		if !isUsingInTreeVolumePlugin && supportsZRS {
+			test.StorageClassParameters = map[string]string{"skuName": "StandardSSD_ZRS"}
 		}
 		test.Run(cs, ns)
 	})
@@ -732,6 +851,104 @@ func (t *dynamicProvisioningTestSuite) defineTests(isMultiZone bool) {
 		}
 		test.Run(cs, ns)
 	})
+
+	ginkgo.It("Should test pod failover with cordoning a node", func() {
+		skipIfUsingInTreeVolumePlugin()
+		if isMultiZone {
+			ginkgo.Skip("test case does not apply to multi az case")
+		}
+
+		volume := testsuites.VolumeDetails{
+			ClaimSize: "10Gi",
+			VolumeMount: testsuites.VolumeMountDetails{
+				NameGenerate:      "test-volume-",
+				MountPathGenerate: "/mnt/test-",
+			},
+		}
+		pod := testsuites.PodDetails{
+			Cmd: convertToPowershellorCmdCommandIfNecessary("echo 'hello world' >> /mnt/test-1/data && while true; do sleep 3600; done"),
+			Volumes: t.normalizeVolumes([]testsuites.VolumeDetails{
+				{
+					ClaimSize: volume.ClaimSize,
+					MountOptions: []string{
+						"barrier=1",
+						"acl",
+					},
+					VolumeMount: volume.VolumeMount,
+				},
+			}, false),
+			IsWindows: isWindowsCluster,
+			UseCMD:    false,
+		}
+		podCheckCmd := []string{"cat", "/mnt/test-1/data"}
+		expectedString := "hello world\n"
+		if isWindowsCluster {
+			podCheckCmd = []string{"cmd", "/c", "type C:\\mnt\\test-1\\data.txt"}
+			expectedString = "hello world\r\n"
+		}
+
+		storageClassParameters := map[string]string{"skuName": "StandardSSD_LRS"}
+
+		test := testsuites.PodFailover{
+			CSIDriver: testDriver,
+			Pod:       pod,
+			Volume:    volume,
+			PodCheck: &testsuites.PodExecCheck{
+				Cmd:            podCheckCmd,
+				ExpectedString: expectedString, // pod will be restarted so expect to see 2 instances of string
+			},
+			StorageClassParameters: storageClassParameters,
+		}
+		test.Run(cs, ns)
+	})
+
+	ginkgo.It("Should test pod failover with cordoning a node using ZRS", func() {
+		skipIfUsingInTreeVolumePlugin()
+		skipIfNotZRSSupported()
+
+		volume := testsuites.VolumeDetails{
+			ClaimSize: "10Gi",
+			VolumeMount: testsuites.VolumeMountDetails{
+				NameGenerate:      "test-volume-",
+				MountPathGenerate: "/mnt/test-",
+			},
+		}
+		pod := testsuites.PodDetails{
+			Cmd: convertToPowershellorCmdCommandIfNecessary("echo 'hello world' >> /mnt/test-1/data && while true; do sleep 3600; done"),
+			Volumes: t.normalizeVolumes([]testsuites.VolumeDetails{
+				{
+					ClaimSize: volume.ClaimSize,
+					MountOptions: []string{
+						"barrier=1",
+						"acl",
+					},
+					VolumeMount: volume.VolumeMount,
+				},
+			}, false),
+			IsWindows: isWindowsCluster,
+			UseCMD:    false,
+		}
+		podCheckCmd := []string{"cat", "/mnt/test-1/data"}
+		expectedString := "hello world\n"
+		if isWindowsCluster {
+			podCheckCmd = []string{"cmd", "/c", "type C:\\mnt\\test-1\\data.txt"}
+			expectedString = "hello world\r\n"
+		}
+
+		storageClassParameters := map[string]string{"skuName": "StandardSSD_ZRS"}
+
+		test := testsuites.PodFailover{
+			CSIDriver: testDriver,
+			Pod:       pod,
+			Volume:    volume,
+			PodCheck: &testsuites.PodExecCheck{
+				Cmd:            podCheckCmd,
+				ExpectedString: expectedString, // pod will be restarted so expect to see 2 instances of string
+			},
+			StorageClassParameters: storageClassParameters,
+		}
+		test.Run(cs, ns)
+	})
 }
 
 // Normalize volumes by adding allowed topology values and WaitForFirstConsumer binding mode if we are testing in a multi-az cluster
@@ -743,13 +960,20 @@ func (t *dynamicProvisioningTestSuite) normalizeVolumes(volumes []testsuites.Vol
 }
 
 func (t *dynamicProvisioningTestSuite) normalizeVolume(volume testsuites.VolumeDetails, isMultiZone bool) testsuites.VolumeDetails {
-	if !isMultiZone {
-		return volume
+	driverName := os.Getenv(driver.AzureDriverNameVar)
+	switch driverName {
+	case "kubernetes.io/azure-disk":
+		volumeBindingMode := storagev1.VolumeBindingWaitForFirstConsumer
+		volume.VolumeBindingMode = &volumeBindingMode
+	case "", azuredisk.DefaultDriverName:
+		if !isMultiZone {
+			return volume
+		}
+		volume.AllowedTopologyValues = t.allowedTopologyValues
+		volumeBindingMode := storagev1.VolumeBindingWaitForFirstConsumer
+		volume.VolumeBindingMode = &volumeBindingMode
 	}
 
-	volume.AllowedTopologyValues = t.allowedTopologyValues
-	volumeBindingMode := storagev1.VolumeBindingWaitForFirstConsumer
-	volume.VolumeBindingMode = &volumeBindingMode
 	return volume
 }
 

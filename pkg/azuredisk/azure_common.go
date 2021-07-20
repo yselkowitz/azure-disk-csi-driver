@@ -24,7 +24,7 @@ import (
 	"strconv"
 	libstrings "strings"
 
-	"github.com/Azure/azure-sdk-for-go/services/compute/mgmt/2020-06-30/compute"
+	"github.com/Azure/azure-sdk-for-go/services/compute/mgmt/2020-12-01/compute"
 
 	v1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/util/sets"
@@ -45,6 +45,19 @@ var (
 
 	lunPathRE = regexp.MustCompile(`/dev(?:.*)/disk/azure/scsi(?:.*)/lun(.+)`)
 )
+
+func normalizeNetworkAccessPolicy(networkAccessPolicy string) (compute.NetworkAccessPolicy, error) {
+	if networkAccessPolicy == "" {
+		return compute.AllowAll, nil
+	}
+	policy := compute.NetworkAccessPolicy(networkAccessPolicy)
+	for _, s := range compute.PossibleNetworkAccessPolicyValues() {
+		if policy == s {
+			return policy, nil
+		}
+	}
+	return "", fmt.Errorf("azureDisk - %s is not supported NetworkAccessPolicy. Supported values are %s", networkAccessPolicy, compute.PossibleNetworkAccessPolicyValues())
+}
 
 func normalizeStorageAccountType(storageAccountType, cloud string, disableAzureStackCloud bool) (compute.DiskStorageAccountTypes, error) {
 	if storageAccountType == "" {

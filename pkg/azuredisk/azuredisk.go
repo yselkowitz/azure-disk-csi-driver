@@ -22,9 +22,10 @@ import (
 	"reflect"
 	"regexp"
 	"strings"
+	"time"
 	"unicode"
 
-	"github.com/Azure/azure-sdk-for-go/services/compute/mgmt/2020-06-30/compute"
+	"github.com/Azure/azure-sdk-for-go/services/compute/mgmt/2020-12-01/compute"
 	"github.com/container-storage-interface/spec/lib/go/csi"
 	"github.com/pborman/uuid"
 
@@ -37,16 +38,19 @@ import (
 
 	csicommon "sigs.k8s.io/azuredisk-csi-driver/pkg/csi-common"
 	"sigs.k8s.io/azuredisk-csi-driver/pkg/mounter"
+	"sigs.k8s.io/azuredisk-csi-driver/pkg/optimization"
 	volumehelper "sigs.k8s.io/azuredisk-csi-driver/pkg/util"
+	azcache "sigs.k8s.io/cloud-provider-azure/pkg/cache"
+	consts "sigs.k8s.io/cloud-provider-azure/pkg/consts"
 	"sigs.k8s.io/cloud-provider-azure/pkg/provider"
 	azure "sigs.k8s.io/cloud-provider-azure/pkg/provider"
 )
 
 const (
 	// DriverName driver name
-	DriverName       = "disk.csi.azure.com"
-	azurePublicCloud = "AZUREPUBLICCLOUD"
-	azureStackCloud  = "AZURESTACKCLOUD"
+	DefaultDriverName = "disk.csi.azure.com"
+	azurePublicCloud  = "AZUREPUBLICCLOUD"
+	azureStackCloud   = "AZURESTACKCLOUD"
 
 	errDiskNotFound = "not found"
 	// default IOPS Caps & Throughput Cap (MBps) per https://docs.microsoft.com/en-us/azure/virtual-machines/linux/disks-ultra-ssd
@@ -60,6 +64,7 @@ const (
 	minimumDiskSizeGiB = 1
 
 	resourceNotFound = "ResourceNotFound"
+	rateLimited      = "rate limited"
 
 	// VolumeAttributes for Partition
 	volumeAttributePartition = "partition"
@@ -73,20 +78,36 @@ const (
 	// LUN lun number
 	LUN = "LUN"
 
-	cachingModeField        = "cachingmode"
-	storageAccountTypeField = "storageaccounttype"
-	storageAccountField     = "storageaccount"
-	skuNameField            = "skuname"
-	locationField           = "location"
-	resourceGroupField      = "resourcegroup"
-	diskIOPSReadWriteField  = "diskiopsreadwrite"
-	diskMBPSReadWriteField  = "diskmbpsreadwrite"
-	diskNameField           = "diskname"
-	desIDField              = "diskencryptionsetid"
-	tagsField               = "tags"
-	maxSharesField          = "maxshares"
-	incrementalField        = "incremental"
-	logicalSectorSizeField  = "logicalsectorsize"
+	trueValue                = "true"
+	cachingModeField         = "cachingmode"
+	storageAccountTypeField  = "storageaccounttype"
+	skuNameField             = "skuname"
+	locationField            = "location"
+	resourceGroupField       = "resourcegroup"
+	diskIOPSReadWriteField   = "diskiopsreadwrite"
+	diskMBPSReadWriteField   = "diskmbpsreadwrite"
+	diskNameField            = "diskname"
+	desIDField               = "diskencryptionsetid"
+	tagsField                = "tags"
+	maxSharesField           = "maxshares"
+	incrementalField         = "incremental"
+	logicalSectorSizeField   = "logicalsectorsize"
+	fsTypeField              = "fstype"
+	kindField                = "kind"
+	perfProfileField         = "perfprofile"
+	networkAccessPolicyField = "networkaccesspolicy"
+	diskAccessIDField        = "diskaccessid"
+	enableBurstingField      = "enablebursting"
+
+	WellKnownTopologyKey = "topology.kubernetes.io/zone"
+	throttlingKey        = "throttlingKey"
+
+	pvcNameKey      = "csi.storage.k8s.io/pvc/name"
+	pvcNamespaceKey = "csi.storage.k8s.io/pvc/namespace"
+	pvNameKey       = "csi.storage.k8s.io/pv/name"
+	pvcNameTag      = "kubernetes.io-created-for-pvc-name"
+	pvcNamespaceTag = "kubernetes.io-created-for-pvc-namespace"
+	pvNameTag       = "kubernetes.io-created-for-pv-name"
 )
 
 var (
@@ -95,47 +116,78 @@ var (
 	diskURISupportedManaged = []string{"/subscriptions/{sub-id}/resourcegroups/{group-name}/providers/microsoft.compute/disks/{disk-id}"}
 )
 
+// DriverOptions defines driver parameters specified in driver deployment
+type DriverOptions struct {
+	NodeID                     string
+	DriverName                 string
+	VolumeAttachLimit          int64
+	EnablePerfOptimization     bool
+	CloudConfigSecretName      string
+	CloudConfigSecretNamespace string
+}
+
 // CSIDriver defines the interface for a CSI driver.
 type CSIDriver interface {
 	csi.ControllerServer
 	csi.NodeServer
 	csi.IdentityServer
 
-	Run(endpoint, kubeconfig string, testMode bool)
+	Run(endpoint, kubeconfig string, disableAVSetNodes, testMode bool)
 }
 
 // DriverCore contains fields common to both the V1 and V2 driver, and implements all interfaces of CSI drivers
 type DriverCore struct {
 	csicommon.CSIDriver
-	cloud   *azure.Cloud
-	mounter *mount.SafeFormatAndMount
+	perfOptimizationEnabled    bool
+	cloudConfigSecretName      string
+	cloudConfigSecretNamespace string
+	cloud                      *azure.Cloud
+	mounter                    *mount.SafeFormatAndMount
+	deviceHelper               *optimization.SafeDeviceHelper
+	nodeInfo                   *optimization.NodeInfo
 }
 
 // Driver is the v1 implementation of the Azure Disk CSI Driver.
 type Driver struct {
 	DriverCore
 	volumeLocks *volumehelper.VolumeLocks
+	// a timed cache GetDisk throttling
+	getDiskThrottlingCache *azcache.TimedCache
 }
 
 // newDriverV1 Creates a NewCSIDriver object. Assumes vendor version is equal to driver version &
 // does not support optional driver plugin info manifest field. Refer to CSI spec for more details.
-func newDriverV1(nodeID string) *Driver {
+func newDriverV1(options *DriverOptions) *Driver {
 	driver := Driver{}
-	driver.Name = DriverName
+	driver.Name = options.DriverName
 	driver.Version = driverVersion
-	driver.NodeID = nodeID
+	driver.NodeID = options.NodeID
+	driver.VolumeAttachLimit = options.VolumeAttachLimit
+	driver.perfOptimizationEnabled = options.EnablePerfOptimization
+	driver.cloudConfigSecretName = options.CloudConfigSecretName
+	driver.cloudConfigSecretNamespace = options.CloudConfigSecretNamespace
 	driver.volumeLocks = volumehelper.NewVolumeLocks()
+
+	topologyKey = fmt.Sprintf("topology.%s/zone", driver.Name)
+
+	cache, err := azcache.NewTimedcache(5*time.Minute, func(key string) (interface{}, error) {
+		return nil, nil
+	})
+	if err != nil {
+		klog.Fatalf("%v", err)
+	}
+	driver.getDiskThrottlingCache = cache
 	return &driver
 }
 
 // Run driver initialization
-func (d *Driver) Run(endpoint, kubeconfig string, testBool bool) {
-	versionMeta, err := GetVersionYAML()
+func (d *Driver) Run(endpoint, kubeconfig string, disableAVSetNodes, testingMock bool) {
+	versionMeta, err := GetVersionYAML(d.Name)
 	if err != nil {
 		klog.Fatalf("%v", err)
 	}
 	klog.Infof("\nDRIVER INFORMATION:\n-------------------\n%s\n\nStreaming logs below:", versionMeta)
-	cloud, err := GetCloudProvider(kubeconfig)
+	cloud, err := GetCloudProvider(kubeconfig, d.cloudConfigSecretName, d.cloudConfigSecretNamespace)
 	if err != nil || cloud.TenantID == "" || cloud.SubscriptionID == "" {
 		klog.Fatalf("failed to get Azure Cloud Provider, error: %v", err)
 	}
@@ -144,8 +196,26 @@ func (d *Driver) Run(endpoint, kubeconfig string, testBool bool) {
 	if d.NodeID == "" {
 		// Disable UseInstanceMetadata for controller to mitigate a timeout issue using IMDS
 		// https://github.com/kubernetes-sigs/azuredisk-csi-driver/issues/168
-		klog.Infoln("disable UseInstanceMetadata for controller")
+		klog.V(2).Infof("disable UseInstanceMetadata for controller")
 		d.cloud.Config.UseInstanceMetadata = false
+
+		if d.cloud.VMType == consts.VMTypeVMSS && !d.cloud.DisableAvailabilitySetNodes {
+			if disableAVSetNodes {
+				klog.V(2).Infof("DisableAvailabilitySetNodes for controller since current VMType is vmss")
+				d.cloud.DisableAvailabilitySetNodes = true
+			} else {
+				klog.Warningf("DisableAvailabilitySetNodes for controller is set as false while current VMType is vmss")
+			}
+		}
+	}
+
+	d.deviceHelper = optimization.NewSafeDeviceHelper()
+
+	if d.getPerfOptimizationEnabled() {
+		d.nodeInfo, err = optimization.NewNodeInfo(d.getCloud(), d.NodeID)
+		if err != nil {
+			klog.Fatalf("Failed to get node info. Error: %v", err)
+		}
 	}
 
 	d.mounter, err = mounter.NewSafeMounter()
@@ -173,7 +243,7 @@ func (d *Driver) Run(endpoint, kubeconfig string, testBool bool) {
 
 	s := csicommon.NewNonBlockingGRPCServer()
 	// Driver d act as IdentityServer, ControllerServer and NodeServer
-	s.Start(endpoint, d, d, d, testBool)
+	s.Start(endpoint, d, d, d, testingMock)
 	s.Wait()
 }
 
@@ -201,34 +271,68 @@ func GetResourceGroupFromURI(diskURI string) (string, error) {
 	return fields[4], nil
 }
 
-func (d *Driver) checkDiskExists(ctx context.Context, diskURI string) error {
+func (d *Driver) isGetDiskThrottled() bool {
+	cache, err := d.getDiskThrottlingCache.Get(throttlingKey, azcache.CacheReadTypeDefault)
+	if err != nil {
+		klog.Warningf("getDiskThrottlingCache(%s) return with error: %s", throttlingKey, err)
+		return false
+	}
+	return cache != nil
+}
+
+func (d *Driver) checkDiskExists(ctx context.Context, diskURI string) (*compute.Disk, error) {
 	diskName, err := GetDiskName(diskURI)
 	if err != nil {
-		return err
+		return nil, err
 	}
 
 	resourceGroup, err := GetResourceGroupFromURI(diskURI)
 	if err != nil {
-		return err
+		return nil, err
 	}
 
-	if _, rerr := d.cloud.DisksClient.Get(ctx, resourceGroup, diskName); rerr != nil {
-		return rerr.Error()
+	if d.isGetDiskThrottled() {
+		klog.Warningf("skip checkDiskExists(%s) since it's still in throttling", diskURI)
+		return nil, nil
 	}
 
-	return nil
+	disk, rerr := d.cloud.DisksClient.Get(ctx, resourceGroup, diskName)
+	if rerr != nil {
+		if strings.Contains(rerr.RawError.Error(), rateLimited) {
+			klog.Warningf("checkDiskExists(%s) is throttled with error: %v", diskURI, rerr.Error())
+			d.getDiskThrottlingCache.Set(throttlingKey, "")
+			return &disk, nil
+		}
+		return nil, rerr.Error()
+	}
+
+	return &disk, nil
 }
 
 func (d *Driver) checkDiskCapacity(ctx context.Context, resourceGroup, diskName string, requestGiB int) (bool, error) {
-	disk, err := d.cloud.DisksClient.Get(ctx, resourceGroup, diskName)
+	if d.isGetDiskThrottled() {
+		klog.Warningf("skip checkDiskCapacity((%s, %s) since it's still in throttling", resourceGroup, diskName)
+		return true, nil
+	}
+
+	disk, rerr := d.cloud.DisksClient.Get(ctx, resourceGroup, diskName)
 	// Because we can not judge the reason of the error. Maybe the disk does not exist.
 	// So here we do not handle the error.
-	if err == nil {
+	if rerr == nil {
 		if !reflect.DeepEqual(disk, compute.Disk{}) && disk.DiskSizeGB != nil && int(*disk.DiskSizeGB) != requestGiB {
 			return false, status.Errorf(codes.AlreadyExists, "the request volume already exists, but its capacity(%v) is different from (%v)", *disk.DiskProperties.DiskSizeGB, requestGiB)
 		}
+	} else {
+		if strings.Contains(rerr.RawError.Error(), rateLimited) {
+			klog.Warningf("checkDiskCapacity(%s, %s) is throttled with error: %v", resourceGroup, diskName, rerr.Error())
+			d.getDiskThrottlingCache.Set(throttlingKey, "")
+		}
 	}
 	return true, nil
+}
+
+func (d *Driver) getVolumeLocks() *volumehelper.VolumeLocks {
+	return d.volumeLocks
 }
 
 func isValidDiskURI(diskURI string) error {
@@ -384,4 +488,19 @@ func (d *DriverCore) getMounter() *mount.SafeFormatAndMount {
 // setMounter sets the mounter field. It is intended for use with unit tests.
 func (d *DriverCore) setMounter(mounter *mount.SafeFormatAndMount) {
 	d.mounter = mounter
+}
+
+// getPerfOptimizationEnabled returns the value of the perfOptimizationEnabled field. It is intended for use with unit tests.
+func (d *DriverCore) getPerfOptimizationEnabled() bool {
+	return d.perfOptimizationEnabled
+}
+
+// getDeviceHelper returns the value of the deviceHelper field. It is intended for use with unit tests.
+func (d *DriverCore) getDeviceHelper() *optimization.SafeDeviceHelper {
+	return d.deviceHelper
+}
+
+// getNodeInfo returns the value of the nodeInfo field. It is intended for use with unit tests.
+func (d *DriverCore) getNodeInfo() *optimization.NodeInfo {
+	return d.nodeInfo
 }

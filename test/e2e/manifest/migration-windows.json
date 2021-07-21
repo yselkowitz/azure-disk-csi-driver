@@ -16,7 +16,6 @@
                     "--feature-gates": "CSIMigration=true,CSIMigrationAzureDisk=true,CSIMigrationAzureDiskComplete=true"
                 },
                 "apiServerConfig": {
-                    "--feature-gates": "VolumeSnapshotDataSource=true",
                     "--enable-admission-plugins": "NamespaceLifecycle,LimitRanger,ServiceAccount,DefaultStorageClass,ResourceQuota,AlwaysPullImages"
                 }
             }
@@ -39,14 +38,14 @@
         "windowsProfile": {
             "adminUsername": "azureuser",
             "adminPassword": "replacepassword1234$",
-            "csiProxyURL": "https://kubernetesartifacts.azureedge.net/csi-proxy/v0.2.2/binaries/csi-proxy-v0.2.2.tar.gz",
+            "csiProxyURL": "https://github.com/andyzhangx/demo/raw/master/windows/csi-proxy-v1.0.0-rc.1.tar.gz",
             "enableCSIProxy": true,
             "sshEnabled": true,
             "windowsPublisher": "microsoft-aks",
             "windowsOffer": "aks-windows",
             "windowsSku": "aks-2019-datacenter-core-smalldisk-2101",
             "imageVersion": "17763.1697.210113"
-        },        
+        },
         "linuxProfile": {
             "adminUsername": "azureuser",
             "ssh": {

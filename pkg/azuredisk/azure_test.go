@@ -82,12 +82,12 @@ users:
 		{
 			desc:        "[failure] out of cluster, no kubeconfig, no credential file",
 			kubeconfig:  "",
-			expectedErr: fmt.Errorf("Failed to load config from file: %s, cloud not get azure cloud provider", DefaultCredFilePathLinux),
+			expectedErr: fmt.Errorf("load azure config from file(%s) failed with open %s: no such file or directory", DefaultCredFilePathLinux, DefaultCredFilePathLinux),
 		},
 		{
 			desc:        "[failure] out of cluster & in cluster, specify a non-exist kubeconfig, no credential file",
 			kubeconfig:  "/tmp/non-exist.json",
-			expectedErr: fmt.Errorf("Failed to load config from file: %s, cloud not get azure cloud provider", DefaultCredFilePathLinux),
+			expectedErr: fmt.Errorf("load azure config from file(%s) failed with open %s: no such file or directory", DefaultCredFilePathLinux, DefaultCredFilePathLinux),
 		},
 		{
 			desc:        "[failure] out of cluster & in cluster, specify a empty kubeconfig, no credential file",
@@ -97,7 +97,7 @@ users:
 		{
 			desc:        "[failure] out of cluster & in cluster, specify a fake kubeconfig, no credential file",
 			kubeconfig:  fakeKubeConfig,
-			expectedErr: fmt.Errorf("Failed to load config from file: %s, cloud not get azure cloud provider", DefaultCredFilePathLinux),
+			expectedErr: fmt.Errorf("load azure config from file(%s) failed with open %s: no such file or directory", DefaultCredFilePathLinux, DefaultCredFilePathLinux),
 		},
 		{
 			desc:        "[success] out of cluster & in cluster, no kubeconfig, a fake credential file",
@@ -141,7 +141,7 @@ users:
 			}
 			os.Setenv(DefaultAzureCredentialFileEnv, fakeCredFile)
 		}
-		_, err := GetCloudProvider(test.kubeconfig)
+		_, err := GetCloudProvider(test.kubeconfig, "", "")
 		if !reflect.DeepEqual(err, test.expectedErr) {
 			t.Errorf("desc: %s,\n input: %q, GetCloudProvider err: %v, expectedErr: %v", test.desc, test.kubeconfig, err, test.expectedErr)
 		}

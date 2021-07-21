@@ -21,9 +21,10 @@ package azuredisk
 import (
 	"context"
 	"flag"
+	"fmt"
 	"reflect"
 
-	"github.com/Azure/azure-sdk-for-go/services/compute/mgmt/2020-06-30/compute"
+	"github.com/Azure/azure-sdk-for-go/services/compute/mgmt/2020-12-01/compute"
 	"github.com/container-storage-interface/spec/lib/go/csi"
 
 	"google.golang.org/grpc/codes"
@@ -33,7 +34,9 @@ import (
 
 	csicommon "sigs.k8s.io/azuredisk-csi-driver/pkg/csi-common"
 	"sigs.k8s.io/azuredisk-csi-driver/pkg/mounter"
+	"sigs.k8s.io/azuredisk-csi-driver/pkg/optimization"
 	volumehelper "sigs.k8s.io/azuredisk-csi-driver/pkg/util"
+	consts "sigs.k8s.io/cloud-provider-azure/pkg/consts"
 )
 
 var useDriverV2 = flag.Bool("temp-use-driver-v2", false, "A temporary flag to enable early test and development of Azure Disk CSI Driver V2. This will be removed in the future.")
@@ -45,38 +48,40 @@ type DriverV2 struct {
 }
 
 // NewDriver creates a Driver or DriverV2 object depending on the --temp-use-driver-v2 flag.
-func NewDriver(nodeID string) CSIDriver {
-	var d CSIDriver
-
+func NewDriver(options *DriverOptions) CSIDriver {
 	if !*useDriverV2 {
-		d = newDriverV1(nodeID)
+		return newDriverV1(options)
 	} else {
-		d = newDriverV2(nodeID)
+		return newDriverV2(options)
 	}
-
-	return d
 }
 
 // newDriverV2 Creates a NewCSIDriver object. Assumes vendor version is equal to driver version &
 // does not support optional driver plugin info manifest field. Refer to CSI spec for more details.
-func newDriverV2(nodeID string) *DriverV2 {
+func newDriverV2(options *DriverOptions) *DriverV2 {
 	klog.Warning("Using DriverV2")
 	driver := DriverV2{}
-	driver.Name = DriverName
+	driver.Name = options.DriverName
 	driver.Version = driverVersion
-	driver.NodeID = nodeID
+	driver.NodeID = options.NodeID
+	driver.VolumeAttachLimit = options.VolumeAttachLimit
 	driver.volumeLocks = volumehelper.NewVolumeLocks()
+	driver.perfOptimizationEnabled = options.EnablePerfOptimization
+	driver.cloudConfigSecretName = options.CloudConfigSecretName
+	driver.cloudConfigSecretNamespace = options.CloudConfigSecretNamespace
+
+	topologyKey = fmt.Sprintf("topology.%s/zone", driver.Name)
 	return &driver
 }
 
 // Run driver initialization
-func (d *DriverV2) Run(endpoint, kubeconfig string, testBool bool) {
-	versionMeta, err := GetVersionYAML()
+func (d *DriverV2) Run(endpoint, kubeconfig string, disableAVSetNodes, testingMock bool) {
+	versionMeta, err := GetVersionYAML(d.Name)
 	if err != nil {
 		klog.Fatalf("%v", err)
 	}
 	klog.Infof("\nDRIVER INFORMATION:\n-------------------\n%s\n\nStreaming logs below:", versionMeta)
-	cloud, err := GetCloudProvider(kubeconfig)
+	cloud, err := GetCloudProvider(kubeconfig, d.cloudConfigSecretName, d.cloudConfigSecretNamespace)
 	if err != nil || cloud.TenantID == "" || cloud.SubscriptionID == "" {
 		klog.Fatalf("failed to get Azure Cloud Provider, error: %v", err)
 	}
@@ -87,6 +92,20 @@ func (d *DriverV2) Run(endpoint, kubeconfig string, testBool bool) {
 		// https://github.com/kubernetes-sigs/azuredisk-csi-driver/issues/168
 		klog.Infoln("disable UseInstanceMetadata for controller")
 		d.cloud.Config.UseInstanceMetadata = false
+
+		if disableAVSetNodes && d.cloud.VMType == consts.VMTypeVMSS {
+			klog.V(2).Infof("DisableAvailabilitySetNodes for controller since current VMType is vmss")
+			d.cloud.DisableAvailabilitySetNodes = true
+		}
+	}
+
+	d.deviceHelper = optimization.NewSafeDeviceHelper()
+
+	if d.getPerfOptimizationEnabled() {
+		d.nodeInfo, err = optimization.NewNodeInfo(d.getCloud(), d.NodeID)
+		if err != nil {
+			klog.Fatalf("Failed to get node info. Error: %v", err)
+		}
 	}
 
 	d.mounter, err = mounter.NewSafeMounter()
@@ -114,26 +133,27 @@ func (d *DriverV2) Run(endpoint, kubeconfig string, testBool bool) {
 
 	s := csicommon.NewNonBlockingGRPCServer()
 	// Driver d act as IdentityServer, ControllerServer and NodeServer
-	s.Start(endpoint, d, d, d, testBool)
+	s.Start(endpoint, d, d, d, testingMock)
 	s.Wait()
 }
 
-func (d *DriverV2) checkDiskExists(ctx context.Context, diskURI string) error {
+func (d *DriverV2) checkDiskExists(ctx context.Context, diskURI string) (*compute.Disk, error) {
 	diskName, err := GetDiskName(diskURI)
 	if err != nil {
-		return err
+		return nil, err
 	}
 
 	resourceGroup, err := GetResourceGroupFromURI(diskURI)
 	if err != nil {
-		return err
+		return nil, err
 	}
 
-	if _, rerr := d.cloud.DisksClient.Get(ctx, resourceGroup, diskName); rerr != nil {
-		return rerr.Error()
+	disk, rerr := d.cloud.DisksClient.Get(ctx, resourceGroup, diskName)
+	if rerr != nil {
+		return nil, rerr.Error()
 	}
 
-	return nil
+	return &disk, nil
 }
 
 func (d *DriverV2) checkDiskCapacity(ctx context.Context, resourceGroup, diskName string, requestGiB int) (bool, error) {
@@ -146,4 +166,8 @@ func (d *DriverV2) checkDiskCapacity(ctx context.Context, resourceGroup, diskNam
 		}
 	}
 	return true, nil
+}
+
+func (d *DriverV2) getVolumeLocks() *volumehelper.VolumeLocks {
+	return d.volumeLocks
 }

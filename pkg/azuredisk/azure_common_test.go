@@ -24,7 +24,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/Azure/azure-sdk-for-go/services/compute/mgmt/2020-06-30/compute"
+	"github.com/Azure/azure-sdk-for-go/services/compute/mgmt/2020-12-01/compute"
 	"github.com/stretchr/testify/assert"
 
 	v1 "k8s.io/api/core/v1"
@@ -249,6 +249,52 @@ func TestNormalizeCachingMode(t *testing.T) {
 		assert.Equal(t, err, test.expectedErr, fmt.Sprintf("error msg: %v", err))
 	}
 }
+
+func TestNormalizeNetworkAccessPolicy(t *testing.T) {
+	tests := []struct {
+		networkAccessPolicy         string
+		expectedNetworkAccessPolicy compute.NetworkAccessPolicy
+		expectError                 bool
+	}{
+		{
+			networkAccessPolicy:         "",
+			expectedNetworkAccessPolicy: compute.AllowAll,
+			expectError:                 false,
+		},
+		{
+			networkAccessPolicy:         "AllowAll",
+			expectedNetworkAccessPolicy: compute.AllowAll,
+			expectError:                 false,
+		},
+		{
+			networkAccessPolicy:         "DenyAll",
+			expectedNetworkAccessPolicy: compute.DenyAll,
+			expectError:                 false,
+		},
+		{
+			networkAccessPolicy:         "AllowPrivate",
+			expectedNetworkAccessPolicy: compute.AllowPrivate,
+			expectError:                 false,
+		},
+		{
+			networkAccessPolicy:         "allowAll",
+			expectedNetworkAccessPolicy: compute.NetworkAccessPolicy(""),
+			expectError:                 true,
+		},
+		{
+			networkAccessPolicy:         "invalid",
+			expectedNetworkAccessPolicy: compute.NetworkAccessPolicy(""),
+			expectError:                 true,
+		},
+	}
+
+	for _, test := range tests {
+		result, err := normalizeNetworkAccessPolicy(test.networkAccessPolicy)
+		assert.Equal(t, result, test.expectedNetworkAccessPolicy)
+		assert.Equal(t, err != nil, test.expectError, fmt.Sprintf("error msg: %v", err))
+	}
+}
+
 func TestGetDiskLUN(t *testing.T) {
 	tests := []struct {
 		deviceInfo  string

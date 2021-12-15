@@ -20,9 +20,9 @@ metadata:
   name: managed-csi
 provisioner: disk.csi.azure.com
 parameters:
-  skuname: StandardSSD_LRS  # available values: Standard_LRS, Premium_LRS, StandardSSD_LRS, UltraSSD_LRS, Premium_ZRS, StandardSSD_ZRS
+  skuName: StandardSSD_LRS  # available values: Standard_LRS, Premium_LRS, StandardSSD_LRS, UltraSSD_LRS, Premium_ZRS, StandardSSD_ZRS
 reclaimPolicy: Delete
-volumeBindingMode: WaitForFirstConsumer  # make sure `volumeBindingMode` is set as `WaitForFirstConsumer`
+volumeBindingMode: Immediate
 ```
 
 ### Follow azure disk dynamic provisioning
@@ -30,17 +30,10 @@ volumeBindingMode: WaitForFirstConsumer  # make sure `volumeBindingMode` is set 
 Continue step `Create an azuredisk CSI PVC`, refer to [Basic usage](../e2e_usage.md)
 
 #### ZRS disk support
- - available version: v1.2.0+
- - current stage: Preview
+ - available version: v1.5.0+
 
 ZRS(`Premium_ZRS`, `StandardSSD_ZRS`) disk could be scheduled on all zone and non-zone agent nodes, without the restriction that disk volume should be co-located in the same zone as a given node.
 
- - Register ZRS disk feature
-```console
-az feature register --name SsdZrsManagedDisks --namespace Microsoft.Compute
-az feature list -o table --query "[?contains(name, 'Microsoft.Compute/SsdZrsManagedDisks')].{Name:name,State:properties.state}"
-az provider register --namespace Microsoft.Compute
-```
  - More details about [Zone-redundant storage for managed disks](https://docs.microsoft.com/en-us/azure/virtual-machines/disks-redundancy#zone-redundant-storage-for-managed-disks-preview)
 
 #### Links

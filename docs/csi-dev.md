@@ -16,7 +16,7 @@ $ make azuredisk
  - Build CSI driver v2
 ```console
 $ cd $GOPATH/src/sigs.k8s.io/azuredisk-csi-driver
-$ BUILD_V2=1 make azuredisk
+$ BUILD_V2=true make azuredisk
 ```
 
  - Run verification before sending PR
@@ -129,7 +129,7 @@ $ csc controller list-snapshots --endpoint tcp://127.0.0.1:10000
 # run `docker login` first
 export REGISTRY=<dockerhub-alias>
 export IMAGE_VERSION=latest
-# build linux, windows 1809, 1903, 1909, and 2004 images
+# build linux, windows images
 make container-all
 # create a manifest list for the images above
 make push-manifest

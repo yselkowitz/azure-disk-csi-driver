@@ -368,8 +368,6 @@ func (az *Cloud) serviceOwnsFrontendIP(fip network.FrontendIPConfiguration, serv
 				return true, isPrimaryService, nil
 			}
 			klog.V(4).Infof("serviceOwnsFrontendIP: the public IP with ID %s is being referenced by other service with public IP address %s", *pip.ID, *pip.IPAddress)
-
-			return false, isPrimaryService, nil
 		}
 
 		return false, isPrimaryService, nil
@@ -503,6 +501,7 @@ func (as *availabilitySet) GetInstanceIDByNodeName(name string) (string, error) 
 
 	machine, err = as.getVirtualMachine(types.NodeName(name), azcache.CacheReadTypeUnsafe)
 	if errors.Is(err, cloudprovider.InstanceNotFound) {
+		klog.Warningf("Unable to find node %s: %v", name, cloudprovider.InstanceNotFound)
 		return "", cloudprovider.InstanceNotFound
 	}
 	if err != nil {
@@ -549,6 +548,20 @@ func (as *availabilitySet) GetPowerStatusByNodeName(name string) (powerState str
 	return vmPowerStateStopped, nil
 }
 
+// GetProvisioningStateByNodeName returns the provisioningState for the specified node.
+func (as *availabilitySet) GetProvisioningStateByNodeName(name string) (provisioningState string, err error) {
+	vm, err := as.getVirtualMachine(types.NodeName(name), azcache.CacheReadTypeDefault)
+	if err != nil {
+		return provisioningState, err
+	}
+
+	if vm.VirtualMachineProperties == nil || vm.VirtualMachineProperties.ProvisioningState == nil {
+		return provisioningState, nil
+	}
+
+	return to.String(vm.VirtualMachineProperties.ProvisioningState), nil
+}
+
 // GetNodeNameByProviderID gets the node name by provider ID.
 func (as *availabilitySet) GetNodeNameByProviderID(providerID string) (types.NodeName, error) {
 	// NodeName is part of providerID for standard instances.
@@ -568,11 +581,15 @@ func (as *availabilitySet) GetInstanceTypeByNodeName(name string) (string, error
 		return "", err
 	}
 
+	if machine.HardwareProfile == nil {
+		return "", fmt.Errorf("HardwareProfile of node(%s) is nil", name)
+	}
 	return string(machine.HardwareProfile.VMSize), nil
 }
 
 // GetZoneByNodeName gets availability zone for the specified node. If the node is not running
 // with availability zone, then it returns fault domain.
+// for details, refer to https://kubernetes-sigs.github.io/cloud-provider-azure/topics/availability-zones/#node-labels
 func (as *availabilitySet) GetZoneByNodeName(name string) (cloudprovider.Zone, error) {
 	vm, err := as.getVirtualMachine(types.NodeName(name), azcache.CacheReadTypeUnsafe)
 	if err != nil {
@@ -936,7 +953,12 @@ func (as *availabilitySet) EnsureHostsInPool(service *v1.Service, nodes []*v1.No
 			continue
 		}
 
-		if as.ShouldNodeExcludedFromLoadBalancer(node) {
+		shouldExcludeLoadBalancer, err := as.ShouldNodeExcludedFromLoadBalancer(localNodeName)
+		if err != nil {
+			klog.Errorf("ShouldNodeExcludedFromLoadBalancer(%s) failed with error: %v", localNodeName, err)
+			return err
+		}
+		if shouldExcludeLoadBalancer {
 			klog.V(4).Infof("Excluding unmanaged/external-resource-group node %q", localNodeName)
 			continue
 		}
@@ -961,7 +983,7 @@ func (as *availabilitySet) EnsureHostsInPool(service *v1.Service, nodes []*v1.No
 }
 
 // EnsureBackendPoolDeleted ensures the loadBalancer backendAddressPools deleted from the specified nodes.
-func (as *availabilitySet) EnsureBackendPoolDeleted(service *v1.Service, backendPoolID, vmSetName string, backendAddressPools *[]network.BackendAddressPool) error {
+func (as *availabilitySet) EnsureBackendPoolDeleted(service *v1.Service, backendPoolID, vmSetName string, backendAddressPools *[]network.BackendAddressPool, deleteFromVMSet bool) error {
 	// Returns nil if backend address pools already deleted.
 	if backendAddressPools == nil {
 		return nil
@@ -992,9 +1014,12 @@ func (as *availabilitySet) EnsureBackendPoolDeleted(service *v1.Service, backend
 	for i := range ipConfigurationIDs {
 		ipConfigurationID := ipConfigurationIDs[i]
 		nodeName, _, err := as.GetNodeNameByIPConfigurationID(ipConfigurationID)
-		if err != nil {
+		if err != nil && !errors.Is(err, cloudprovider.InstanceNotFound) {
 			klog.Errorf("Failed to GetNodeNameByIPConfigurationID(%s): %v", ipConfigurationID, err)
 			allErrs = append(allErrs, err)
+			continue
+		}
+		if nodeName == "" {
 			continue
 		}
 
@@ -1127,7 +1152,8 @@ func (as *availabilitySet) GetNodeNameByIPConfigurationID(ipConfigurationID stri
 
 	vm, err := as.getVirtualMachine(types.NodeName(vmName), azcache.CacheReadTypeDefault)
 	if err != nil {
-		return "", "", fmt.Errorf("cannot get the virtual machine by node name %s", vmName)
+		klog.Errorf("Unable to get the virtual machine by node name %s: %v", vmName, err)
+		return "", "", err
 	}
 	asID := ""
 	if vm.VirtualMachineProperties != nil && vm.AvailabilitySet != nil {
@@ -1139,7 +1165,7 @@ func (as *availabilitySet) GetNodeNameByIPConfigurationID(ipConfigurationID stri
 
 	asName, err := getAvailabilitySetNameByID(asID)
 	if err != nil {
-		return "", "", fmt.Errorf("cannot get the availability set name by the availability set ID %s", asID)
+		return "", "", fmt.Errorf("cannot get the availability set name by the availability set ID %s: %v", asID, err)
 	}
 	return vmName, strings.ToLower(asName), nil
 }
@@ -1186,7 +1212,7 @@ func (as *availabilitySet) getAvailabilitySetByNodeName(nodeName string, crt azc
 	}
 
 	if result == nil {
-		klog.Warningf("failed to find the vmas of node %s", nodeName)
+		klog.Warningf("Unable to find node %s: %v", nodeName, cloudprovider.InstanceNotFound)
 		return nil, cloudprovider.InstanceNotFound
 	}
 

@@ -29,7 +29,7 @@ function validate_image() {
   local -r expected_image="${1}"
   local -r image="${2}"
 
-  if [[ "${expected_image}" != "${image}" ]]; then
+  if [[ ! "${expected_image}" == *"${image}" ]]; then
     echo "Expected ${expected_image}, but got ${image} in helm chart"
     exit 1
   fi
@@ -49,7 +49,7 @@ if [[ -z "$(command -v jq)" ]]; then
 fi
 
 # jq-equivalent for yaml
-pip install yq
+pip install yq --ignore-installed PyYAML
 
 # Extract images from csi-azuredisk-controller.yaml
 expected_csi_provisioner_image="$(cat ${PKG_ROOT}/deploy/csi-azuredisk-controller.yaml | yq -r .spec.template.spec.containers[0].image | head -n 1)"

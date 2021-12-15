@@ -17,10 +17,12 @@ limitations under the License.
 package provider
 
 import (
+	"context"
 	"net/http"
 	"strings"
 
 	"github.com/Azure/azure-sdk-for-go/services/compute/mgmt/2020-12-01/compute"
+	"github.com/Azure/go-autorest/autorest/azure"
 	"github.com/Azure/go-autorest/autorest/to"
 
 	"k8s.io/apimachinery/pkg/types"
@@ -31,16 +33,16 @@ import (
 )
 
 // AttachDisk attaches a disk to vm
-func (as *availabilitySet) AttachDisk(nodeName types.NodeName, diskMap map[string]*AttachDiskOptions) error {
+func (as *availabilitySet) AttachDisk(nodeName types.NodeName, diskMap map[string]*AttachDiskOptions) (*azure.Future, error) {
 	vm, err := as.getVirtualMachine(nodeName, azcache.CacheReadTypeDefault)
 	if err != nil {
-		return err
+		return nil, err
 	}
 
 	vmName := mapNodeNameToVMName(nodeName)
 	nodeResourceGroup, err := as.GetNodeResourceGroup(vmName)
 	if err != nil {
-		return err
+		return nil, err
 	}
 
 	disks := make([]compute.DataDisk, len(*vm.StorageProfile.DataDisks))
@@ -49,53 +51,40 @@ func (as *availabilitySet) AttachDisk(nodeName types.NodeName, diskMap map[strin
 	for k, v := range diskMap {
 		diskURI := k
 		opt := v
-		if opt.isManagedDisk {
-			attached := false
-			for _, disk := range *vm.StorageProfile.DataDisks {
-				if disk.ManagedDisk != nil && strings.EqualFold(*disk.ManagedDisk.ID, diskURI) {
-					attached = true
-					break
-				}
+		attached := false
+		for _, disk := range *vm.StorageProfile.DataDisks {
+			if disk.ManagedDisk != nil && strings.EqualFold(*disk.ManagedDisk.ID, diskURI) {
+				attached = true
+				break
 			}
-			if attached {
-				klog.V(2).Infof("azureDisk - disk(%s) already attached to node(%s)", diskURI, nodeName)
-				continue
-			}
-
-			managedDisk := &compute.ManagedDiskParameters{ID: &diskURI}
-			if opt.diskEncryptionSetID == "" {
-				if vm.StorageProfile.OsDisk != nil &&
-					vm.StorageProfile.OsDisk.ManagedDisk != nil &&
-					vm.StorageProfile.OsDisk.ManagedDisk.DiskEncryptionSet != nil &&
-					vm.StorageProfile.OsDisk.ManagedDisk.DiskEncryptionSet.ID != nil {
-					// set diskEncryptionSet as value of os disk by default
-					opt.diskEncryptionSetID = *vm.StorageProfile.OsDisk.ManagedDisk.DiskEncryptionSet.ID
-				}
-			}
-			if opt.diskEncryptionSetID != "" {
-				managedDisk.DiskEncryptionSet = &compute.DiskEncryptionSetParameters{ID: &opt.diskEncryptionSetID}
-			}
-			disks = append(disks,
-				compute.DataDisk{
-					Name:                    &opt.diskName,
-					Lun:                     &opt.lun,
-					Caching:                 opt.cachingMode,
-					CreateOption:            "attach",
-					ManagedDisk:             managedDisk,
-					WriteAcceleratorEnabled: to.BoolPtr(opt.writeAcceleratorEnabled),
-				})
-		} else {
-			disks = append(disks,
-				compute.DataDisk{
-					Name: &opt.diskName,
-					Vhd: &compute.VirtualHardDisk{
-						URI: &diskURI,
-					},
-					Lun:          &opt.lun,
-					Caching:      opt.cachingMode,
-					CreateOption: "attach",
-				})
 		}
+		if attached {
+			klog.V(2).Infof("azureDisk - disk(%s) already attached to node(%s)", diskURI, nodeName)
+			continue
+		}
+
+		managedDisk := &compute.ManagedDiskParameters{ID: &diskURI}
+		if opt.diskEncryptionSetID == "" {
+			if vm.StorageProfile.OsDisk != nil &&
+				vm.StorageProfile.OsDisk.ManagedDisk != nil &&
+				vm.StorageProfile.OsDisk.ManagedDisk.DiskEncryptionSet != nil &&
+				vm.StorageProfile.OsDisk.ManagedDisk.DiskEncryptionSet.ID != nil {
+				// set diskEncryptionSet as value of os disk by default
+				opt.diskEncryptionSetID = *vm.StorageProfile.OsDisk.ManagedDisk.DiskEncryptionSet.ID
+			}
+		}
+		if opt.diskEncryptionSetID != "" {
+			managedDisk.DiskEncryptionSet = &compute.DiskEncryptionSetParameters{ID: &opt.diskEncryptionSetID}
+		}
+		disks = append(disks,
+			compute.DataDisk{
+				Name:                    &opt.diskName,
+				Lun:                     &opt.lun,
+				Caching:                 opt.cachingMode,
+				CreateOption:            "attach",
+				ManagedDisk:             managedDisk,
+				WriteAcceleratorEnabled: to.BoolPtr(opt.writeAcceleratorEnabled),
+			})
 	}
 
 	newVM := compute.VirtualMachineUpdate{
@@ -114,19 +103,27 @@ func (as *availabilitySet) AttachDisk(nodeName types.NodeName, diskMap map[strin
 		_ = as.cloud.vmCache.Delete(vmName)
 	}()
 
-	rerr := as.VirtualMachinesClient.Update(ctx, nodeResourceGroup, vmName, newVM, "attach_disk")
+	future, rerr := as.VirtualMachinesClient.UpdateAsync(ctx, nodeResourceGroup, vmName, newVM, "attach_disk")
 	if rerr != nil {
 		klog.Errorf("azureDisk - attach disk list(%s) on rg(%s) vm(%s) failed, err: %v", diskMap, nodeResourceGroup, vmName, rerr)
 		if rerr.HTTPStatusCode == http.StatusNotFound {
 			klog.Errorf("azureDisk - begin to filterNonExistingDisks(%v) on rg(%s) vm(%s)", diskMap, nodeResourceGroup, vmName)
 			disks := as.filterNonExistingDisks(ctx, *newVM.VirtualMachineProperties.StorageProfile.DataDisks)
 			newVM.VirtualMachineProperties.StorageProfile.DataDisks = &disks
-			rerr = as.VirtualMachinesClient.Update(ctx, nodeResourceGroup, vmName, newVM, "attach_disk")
+			future, rerr = as.VirtualMachinesClient.UpdateAsync(ctx, nodeResourceGroup, vmName, newVM, "attach_disk")
 		}
 	}
 
 	klog.V(2).Infof("azureDisk - update(%s): vm(%s) - attach disk list(%s) returned with %v", nodeResourceGroup, vmName, diskMap, rerr)
 	if rerr != nil {
+		return future, rerr.Error()
+	}
+	return future, nil
+}
+
+// WaitForUpdateResult waits for the response of the update request
+func (as *availabilitySet) WaitForUpdateResult(ctx context.Context, future *azure.Future, resourceGroupName, source string) error {
+	if rerr := as.VirtualMachinesClient.WaitForUpdateResult(ctx, future, resourceGroupName, source); rerr != nil {
 		return rerr.Error()
 	}
 	return nil

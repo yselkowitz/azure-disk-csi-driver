@@ -1,3 +1,4 @@
+//go:build azurediskv2
 // +build azurediskv2
 
 /*
@@ -25,11 +26,18 @@ import (
 	"github.com/golang/mock/gomock"
 	"github.com/stretchr/testify/assert"
 	"k8s.io/klog/v2"
+	testingexec "k8s.io/utils/exec/testing"
+	"sigs.k8s.io/azuredisk-csi-driver/pkg/azureutils"
 	csicommon "sigs.k8s.io/azuredisk-csi-driver/pkg/csi-common"
 	"sigs.k8s.io/azuredisk-csi-driver/pkg/mounter"
+	"sigs.k8s.io/azuredisk-csi-driver/pkg/optimization/mockoptimization"
 	volumehelper "sigs.k8s.io/azuredisk-csi-driver/pkg/util"
 	azure "sigs.k8s.io/cloud-provider-azure/pkg/provider"
 )
+
+type fakeDriverV2 struct {
+	DriverV2
+}
 
 // NewFakeDriver returns a driver implementation suitable for use in unit tests.
 func NewFakeDriver(t *testing.T) (FakeDriver, error) {
@@ -45,25 +53,31 @@ func NewFakeDriver(t *testing.T) (FakeDriver, error) {
 	return d, err
 }
 
-func newFakeDriverV2(t *testing.T) (*DriverV2, error) {
+func newFakeDriverV2(t *testing.T) (*fakeDriverV2, error) {
 	klog.Warning("Using DriverV2")
-	driver := DriverV2{}
+	driver := fakeDriverV2{}
 	driver.Name = fakeDriverName
 	driver.Version = fakeDriverVersion
 	driver.NodeID = fakeNodeID
 	driver.CSIDriver = *csicommon.NewFakeCSIDriver()
 	driver.volumeLocks = volumehelper.NewVolumeLocks()
+	driver.VolumeAttachLimit = -1
+	driver.ioHandler = azureutils.NewFakeIOHandler()
+	driver.hostUtil = azureutils.NewFakeHostUtil()
+	driver.useCSIProxyGAInterface = true
 
 	ctrl := gomock.NewController(t)
 	defer ctrl.Finish()
 
 	driver.cloud = azure.GetTestCloud(ctrl)
-	mounter, err := mounter.NewSafeMounter()
+	mounter, err := mounter.NewSafeMounter(driver.useCSIProxyGAInterface)
 	if err != nil {
 		return nil, err
 	}
 
 	driver.mounter = mounter
+
+	driver.deviceHelper = mockoptimization.NewMockInterface(ctrl)
 
 	driver.AddControllerServiceCapabilities(
 		[]csi.ControllerServiceCapability_RPC_Type{
@@ -88,6 +102,10 @@ func newFakeDriverV2(t *testing.T) (*DriverV2, error) {
 	assert.NotEqual(t, nil, dh)
 
 	return &driver, nil
+}
+
+func (d *fakeDriverV2) setNextCommandOutputScripts(scripts ...testingexec.FakeAction) {
+	d.mounter.Exec.(*mounter.FakeSafeMounter).SetNextCommandOutputScripts(scripts...)
 }
 
 func (d *DriverV2) setDiskThrottlingCache(key string, value string) {

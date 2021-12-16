@@ -10,10 +10,13 @@
                 "cloudProviderRateLimitQPS": 6,
                 "cloudProviderRateLimitBucket": 20,
                 "controllerManagerConfig": {
-                    "--feature-gates": "CSIInlineVolume=true,LocalStorageCapacityIsolation=true,ServiceNodeExclusion=true,CSIMigration=true,CSIMigrationAzureDisk=true,CSIMigrationAzureDiskComplete=true"
+                    "--feature-gates": "CSIMigration=true,CSIMigrationAzureDisk=true"
                 },
                 "kubeletConfig": {
-                    "--feature-gates": "CSIMigration=true,CSIMigrationAzureDisk=true,CSIMigrationAzureDiskComplete=true"
+                    "--feature-gates": "CSIMigration=true,CSIMigrationAzureDisk=true"
+                },
+                "schedulerConfig": {
+                    "--feature-gates": "CSIMigration=true,CSIMigrationAzureDisk=true"
                 },
                 "apiServerConfig": {
                     "--enable-admission-plugins": "NamespaceLifecycle,LimitRanger,ServiceAccount,DefaultStorageClass,ResourceQuota,AlwaysPullImages"
@@ -38,7 +41,7 @@
         "windowsProfile": {
             "adminUsername": "azureuser",
             "adminPassword": "replacepassword1234$",
-            "csiProxyURL": "https://github.com/andyzhangx/demo/raw/master/windows/csi-proxy-v1.0.0-rc.1.tar.gz",
+            "csiProxyURL": "https://acs-mirror.azureedge.net/csi-proxy/v1.0.2/binaries/csi-proxy-v1.0.2.tar.gz",
             "enableCSIProxy": true,
             "sshEnabled": true,
             "windowsPublisher": "microsoft-aks",

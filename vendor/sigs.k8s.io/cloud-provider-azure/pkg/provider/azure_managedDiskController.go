@@ -98,7 +98,7 @@ func (c *ManagedDiskController) CreateManagedDisk(options *ManagedDiskOptions) (
 	// insert original tags to newTags
 	newTags := make(map[string]*string)
 	azureDDTag := "kubernetes-azure-dd"
-	newTags["created-by"] = &azureDDTag
+	newTags[consts.CreatedByTag] = &azureDDTag
 	if options.Tags != nil {
 		for k, v := range options.Tags {
 			// Azure won't allow / (forward slash) in tags
@@ -251,35 +251,33 @@ func (c *ManagedDiskController) CreateManagedDisk(options *ManagedDiskOptions) (
 }
 
 //DeleteManagedDisk : delete managed disk
-func (c *ManagedDiskController) DeleteManagedDisk(diskURI string) error {
-	diskName := path.Base(diskURI)
+func (c *ManagedDiskController) DeleteManagedDisk(ctx context.Context, diskURI string) error {
 	resourceGroup, err := getResourceGroupFromDiskURI(diskURI)
 	if err != nil {
 		return err
 	}
 
-	ctx, cancel := getContextWithCancel()
-	defer cancel()
-
 	if _, ok := c.common.diskStateMap.Load(strings.ToLower(diskURI)); ok {
 		return fmt.Errorf("failed to delete disk(%s) since it's in attaching or detaching state", diskURI)
 	}
 
+	diskName := path.Base(diskURI)
 	disk, rerr := c.common.cloud.DisksClient.Get(ctx, resourceGroup, diskName)
 	if rerr != nil {
 		if rerr.HTTPStatusCode == http.StatusNotFound {
 			klog.V(2).Infof("azureDisk - disk(%s) is already deleted", diskURI)
 			return nil
 		}
-		return rerr.Error()
+		// ignore GetDisk throttling
+		if !rerr.IsThrottled() && !strings.Contains(rerr.RawError.Error(), consts.RateLimited) {
+			return rerr.Error()
+		}
 	}
-
 	if disk.ManagedBy != nil {
 		return fmt.Errorf("disk(%s) already attached to node(%s), could not be deleted", diskURI, *disk.ManagedBy)
 	}
 
-	rerr = c.common.cloud.DisksClient.Delete(ctx, resourceGroup, diskName)
-	if rerr != nil {
+	if rerr := c.common.cloud.DisksClient.Delete(ctx, resourceGroup, diskName); rerr != nil {
 		return rerr.Error()
 	}
 	// We don't need poll here, k8s will immediately stop referencing the disk
@@ -308,7 +306,7 @@ func (c *ManagedDiskController) GetDisk(resourceGroup, diskName string) (string,
 }
 
 // ResizeDisk Expand the disk to new size
-func (c *ManagedDiskController) ResizeDisk(diskURI string, oldSize resource.Quantity, newSize resource.Quantity) (resource.Quantity, error) {
+func (c *ManagedDiskController) ResizeDisk(diskURI string, oldSize resource.Quantity, newSize resource.Quantity, supportOnlineResize bool) (resource.Quantity, error) {
 	ctx, cancel := getContextWithCancel()
 	defer cancel()
 
@@ -341,7 +339,7 @@ func (c *ManagedDiskController) ResizeDisk(diskURI string, oldSize resource.Quan
 		return newSizeQuant, nil
 	}
 
-	if result.DiskProperties.DiskState != compute.Unattached {
+	if !supportOnlineResize && result.DiskProperties.DiskState != compute.Unattached {
 		return oldSize, fmt.Errorf("azureDisk - disk resize is only supported on Unattached disk, current disk state: %s, already attached to %s", result.DiskProperties.DiskState, to.String(result.ManagedBy))
 	}
 

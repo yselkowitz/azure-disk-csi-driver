@@ -17,9 +17,9 @@ GIT_COMMIT ?= $(shell git rev-parse HEAD)
 REGISTRY ?= andyzhangx
 REGISTRY_NAME ?= $(shell echo $(REGISTRY) | sed "s/.azurecr.io//g")
 IMAGE_NAME ?= azuredisk-csi
-ifndef BUILD_V2
+ifneq ($(BUILD_V2), true)
 PLUGIN_NAME = azurediskplugin
-IMAGE_VERSION ?= v1.5.0
+IMAGE_VERSION ?= v1.9.0
 CHART_VERSION ?= latest
 else
 PLUGIN_NAME = azurediskpluginv2
@@ -40,7 +40,7 @@ REV = $(shell git describe --long --tags --dirty)
 BUILD_DATE ?= $(shell date -u +"%Y-%m-%dT%H:%M:%SZ")
 ENABLE_TOPOLOGY ?= false
 LDFLAGS ?= "-X ${PKG}/pkg/azuredisk.driverVersion=${IMAGE_VERSION} -X ${PKG}/pkg/azuredisk.gitCommit=${GIT_COMMIT} -X ${PKG}/pkg/azuredisk.buildDate=${BUILD_DATE} -extldflags "-static"" ${GOTAGS}
-E2E_HELM_OPTIONS ?= --set image.azuredisk.repository=$(REGISTRY)/$(IMAGE_NAME) --set image.azuredisk.tag=$(IMAGE_VERSION) --set image.azuredisk.pullPolicy=Always
+E2E_HELM_OPTIONS ?= --set image.azuredisk.repository=$(REGISTRY)/$(IMAGE_NAME) --set image.azuredisk.tag=$(IMAGE_VERSION) --set image.azuredisk.pullPolicy=Always --set driver.userAgentSuffix="e2e-test"
 E2E_HELM_OPTIONS += ${EXTRA_HELM_OPTIONS}
 GINKGO_FLAGS = -ginkgo.v
 ifeq ($(ENABLE_TOPOLOGY), true)
@@ -59,14 +59,14 @@ ALL_OS = linux windows
 ALL_ARCH.linux = amd64 arm64
 ALL_OS_ARCH.linux = $(foreach arch, ${ALL_ARCH.linux}, linux-$(arch))
 ALL_ARCH.windows = amd64
-ALL_OSVERSIONS.windows := 1809 1903 1909 2004
+ALL_OSVERSIONS.windows := 1809 1903 1909 2004 20H2 ltsc2022
 ALL_OS_ARCH.windows = $(foreach arch, $(ALL_ARCH.windows), $(foreach osversion, ${ALL_OSVERSIONS.windows}, windows-${osversion}-${arch}))
 ALL_OS_ARCH = $(foreach os, $(ALL_OS), ${ALL_OS_ARCH.${os}})
 
 # The current context of image building
 # The architecture of the image
 ARCH ?= amd64
-# OS Version for the Windows images: 1809, 1903, 1909, 2004
+# OS Version for the Windows images: 1809, 1903, 1909, 2004, ltsc2022
 OSVERSION ?= 1809
 # Output type of docker buildx build
 OUTPUT_TYPE ?= registry
@@ -137,11 +137,11 @@ e2e-teardown:
 
 .PHONY: azuredisk
 azuredisk:
-	CGO_ENABLED=0 GOOS=linux go build -a -ldflags ${LDFLAGS} -mod vendor -o _output/${ARCH}/${PLUGIN_NAME} ./pkg/azurediskplugin
+	CGO_ENABLED=0 GOOS=linux GOARCH=$(ARCH) go build -a -ldflags ${LDFLAGS} -mod vendor -o _output/${ARCH}/${PLUGIN_NAME} ./pkg/azurediskplugin
 
 .PHONY: azuredisk-v2
 azuredisk-v2:
-	BUILD_V2=1 $(MAKE) azuredisk
+	BUILD_V2=true $(MAKE) azuredisk
 
 .PHONY: azuredisk-windows
 azuredisk-windows:
@@ -149,7 +149,7 @@ azuredisk-windows:
 
 .PHONY: azuredisk-windows-v2
 azuredisk-windows-v2:
-	BUILD_V2=1 $(MAKE) azuredisk
+	BUILD_V2=true $(MAKE) azuredisk
 
 .PHONY: azuredisk-darwin
 azuredisk-darwin:
@@ -157,7 +157,7 @@ azuredisk-darwin:
 
 .PHONY: container
 container: azuredisk
-	docker build --no-cache -t $(IMAGE_TAG) -f ./pkg/azurediskplugin/dev.Dockerfile .
+	docker build --no-cache -t $(IMAGE_TAG) --output=type=docker -f ./pkg/azurediskplugin/Dockerfile .
 
 .PHONY: container-linux
 container-linux:
@@ -206,19 +206,25 @@ push-manifest:
 	docker manifest create --amend $(IMAGE_TAG) $(foreach osarch, $(ALL_OS_ARCH), $(IMAGE_TAG)-${osarch})
 	# add "os.version" field to windows images (based on https://github.com/kubernetes/kubernetes/blob/master/build/pause/Makefile)
 	set -x; \
-	registry_prefix=$(shell (echo ${REGISTRY} | grep -Eq ".*[\/\.].*") && echo "" || echo "docker.io/"); \
-	manifest_image_folder=`echo "$${registry_prefix}${IMAGE_TAG}" | sed "s|/|_|g" | sed "s/:/-/"`; \
 	for arch in $(ALL_ARCH.windows); do \
 		for osversion in $(ALL_OSVERSIONS.windows); do \
 			BASEIMAGE=mcr.microsoft.com/windows/nanoserver:$${osversion}; \
 			full_version=`docker manifest inspect $${BASEIMAGE} | jq -r '.manifests[0].platform["os.version"]'`; \
-			sed -i -r "s/(\"os\"\:\"windows\")/\0,\"os.version\":\"$${full_version}\"/" "${HOME}/.docker/manifests/$${manifest_image_folder}/$${manifest_image_folder}-windows-$${osversion}-$${arch}"; \
+			docker manifest annotate --os windows --arch $${arch} --os-version $${full_version} $(IMAGE_TAG) $(IMAGE_TAG)-windows-$${osversion}-$${arch}; \
 		done; \
 	done
 	docker manifest push --purge $(IMAGE_TAG)
 	docker manifest inspect $(IMAGE_TAG)
 ifdef PUBLISH
 	docker manifest create $(IMAGE_TAG_LATEST) $(foreach osarch, $(ALL_OS_ARCH), $(IMAGE_TAG)-${osarch})
+	set -x; \
+	for arch in $(ALL_ARCH.windows); do \
+		for osversion in $(ALL_OSVERSIONS.windows); do \
+			BASEIMAGE=mcr.microsoft.com/windows/nanoserver:$${osversion}; \
+			full_version=`docker manifest inspect $${BASEIMAGE} | jq -r '.manifests[0].platform["os.version"]'`; \
+			docker manifest annotate --os windows --arch $${arch} --os-version $${full_version} $(IMAGE_TAG_LATEST) $(IMAGE_TAG)-windows-$${osversion}-$${arch}; \
+		done; \
+	done
 	docker manifest inspect $(IMAGE_TAG_LATEST)
 endif
 

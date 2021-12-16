@@ -1,3 +1,4 @@
+//go:build linux || darwin
 // +build linux darwin
 
 /*
@@ -23,7 +24,7 @@ import (
 	utilexec "k8s.io/utils/exec"
 )
 
-func NewSafeMounter() (*mount.SafeFormatAndMount, error) {
+func NewSafeMounter(useCSIProxyGAInterface bool) (*mount.SafeFormatAndMount, error) {
 	return &mount.SafeFormatAndMount{
 		Interface: mount.New(""),
 		Exec:      utilexec.New(),

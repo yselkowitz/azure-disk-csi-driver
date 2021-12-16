@@ -1,3 +1,4 @@
+//go:build azurediskv2
 // +build azurediskv2
 
 /*
@@ -31,7 +32,9 @@ import (
 	"google.golang.org/grpc/status"
 
 	"k8s.io/klog/v2"
+	"k8s.io/kubernetes/pkg/volume/util/hostutil"
 
+	"sigs.k8s.io/azuredisk-csi-driver/pkg/azureutils"
 	csicommon "sigs.k8s.io/azuredisk-csi-driver/pkg/csi-common"
 	"sigs.k8s.io/azuredisk-csi-driver/pkg/mounter"
 	"sigs.k8s.io/azuredisk-csi-driver/pkg/optimization"
@@ -69,6 +72,11 @@ func newDriverV2(options *DriverOptions) *DriverV2 {
 	driver.perfOptimizationEnabled = options.EnablePerfOptimization
 	driver.cloudConfigSecretName = options.CloudConfigSecretName
 	driver.cloudConfigSecretNamespace = options.CloudConfigSecretNamespace
+	driver.customUserAgent = options.CustomUserAgent
+	driver.userAgentSuffix = options.UserAgentSuffix
+	driver.useCSIProxyGAInterface = options.UseCSIProxyGAInterface
+	driver.ioHandler = azureutils.NewOSIOHandler()
+	driver.hostUtil = hostutil.NewHostUtil()
 
 	topologyKey = fmt.Sprintf("topology.%s/zone", driver.Name)
 	return &driver
@@ -81,8 +89,12 @@ func (d *DriverV2) Run(endpoint, kubeconfig string, disableAVSetNodes, testingMo
 		klog.Fatalf("%v", err)
 	}
 	klog.Infof("\nDRIVER INFORMATION:\n-------------------\n%s\n\nStreaming logs below:", versionMeta)
-	cloud, err := GetCloudProvider(kubeconfig, d.cloudConfigSecretName, d.cloudConfigSecretNamespace)
-	if err != nil || cloud.TenantID == "" || cloud.SubscriptionID == "" {
+
+	userAgent := GetUserAgent(d.Name, d.customUserAgent, d.userAgentSuffix)
+	klog.V(2).Infof("driver userAgent: %s", userAgent)
+
+	cloud, err := azureutils.GetCloudProvider(kubeconfig, d.cloudConfigSecretName, d.cloudConfigSecretNamespace, userAgent, d.allowEmptyCloudConfig)
+	if err != nil {
 		klog.Fatalf("failed to get Azure Cloud Provider, error: %v", err)
 	}
 	d.cloud = cloud
@@ -104,11 +116,11 @@ func (d *DriverV2) Run(endpoint, kubeconfig string, disableAVSetNodes, testingMo
 	if d.getPerfOptimizationEnabled() {
 		d.nodeInfo, err = optimization.NewNodeInfo(d.getCloud(), d.NodeID)
 		if err != nil {
-			klog.Fatalf("Failed to get node info. Error: %v", err)
+			klog.Errorf("Failed to get node info. Error: %v", err)
 		}
 	}
 
-	d.mounter, err = mounter.NewSafeMounter()
+	d.mounter, err = mounter.NewSafeMounter(d.useCSIProxyGAInterface)
 	if err != nil {
 		klog.Fatalf("Failed to get safe mounter. Error: %v", err)
 	}
@@ -123,12 +135,20 @@ func (d *DriverV2) Run(endpoint, kubeconfig string, disableAVSetNodes, testingMo
 			csi.ControllerServiceCapability_RPC_EXPAND_VOLUME,
 			csi.ControllerServiceCapability_RPC_LIST_VOLUMES,
 			csi.ControllerServiceCapability_RPC_LIST_VOLUMES_PUBLISHED_NODES,
+			csi.ControllerServiceCapability_RPC_SINGLE_NODE_MULTI_WRITER,
 		})
-	d.AddVolumeCapabilityAccessModes([]csi.VolumeCapability_AccessMode_Mode{csi.VolumeCapability_AccessMode_SINGLE_NODE_WRITER})
+	d.AddVolumeCapabilityAccessModes(
+		[]csi.VolumeCapability_AccessMode_Mode{
+			csi.VolumeCapability_AccessMode_SINGLE_NODE_WRITER,
+			csi.VolumeCapability_AccessMode_SINGLE_NODE_READER_ONLY,
+			csi.VolumeCapability_AccessMode_SINGLE_NODE_SINGLE_WRITER,
+			csi.VolumeCapability_AccessMode_SINGLE_NODE_MULTI_WRITER,
+		})
 	d.AddNodeServiceCapabilities([]csi.NodeServiceCapability_RPC_Type{
 		csi.NodeServiceCapability_RPC_STAGE_UNSTAGE_VOLUME,
 		csi.NodeServiceCapability_RPC_EXPAND_VOLUME,
 		csi.NodeServiceCapability_RPC_GET_VOLUME_STATS,
+		csi.NodeServiceCapability_RPC_SINGLE_NODE_MULTI_WRITER,
 	})
 
 	s := csicommon.NewNonBlockingGRPCServer()
@@ -138,12 +158,12 @@ func (d *DriverV2) Run(endpoint, kubeconfig string, disableAVSetNodes, testingMo
 }
 
 func (d *DriverV2) checkDiskExists(ctx context.Context, diskURI string) (*compute.Disk, error) {
-	diskName, err := GetDiskName(diskURI)
+	diskName, err := azureutils.GetDiskName(diskURI)
 	if err != nil {
 		return nil, err
 	}
 
-	resourceGroup, err := GetResourceGroupFromURI(diskURI)
+	resourceGroup, err := azureutils.GetResourceGroupFromURI(diskURI)
 	if err != nil {
 		return nil, err
 	}
